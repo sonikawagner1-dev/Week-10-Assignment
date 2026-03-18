@@ -11,6 +11,7 @@ import streamlit as st
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 CHATS_DIR = Path("chats")
+MEMORY_PATH = Path("memory.json")
 
 
 def load_hf_token() -> str | None:
@@ -21,46 +22,6 @@ def load_hf_token() -> str | None:
 
     token = token.strip()
     return token or None
-
-
-def stream_model_response(messages: list[dict[str, str]], hf_token: str):
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "max_tokens": 512,
-        "stream": True,
-    }
-
-    with requests.post(
-        API_URL,
-        headers=headers,
-        json=payload,
-        timeout=30,
-        stream=True,
-    ) as response:
-        response.raise_for_status()
-
-        for raw_line in response.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-            if not raw_line.startswith("data:"):
-                continue
-
-            data_line = raw_line.removeprefix("data:").strip()
-            if data_line == "[DONE]":
-                break
-
-            chunk = json.loads(data_line)
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-
-            delta = choices[0].get("delta", {})
-            content = delta.get("content")
-            if content:
-                yield content
-                time.sleep(0.02)
 
 
 def now_iso() -> str:
@@ -89,8 +50,7 @@ def chat_path(chat_id: str) -> Path:
 
 def save_chat(chat: dict[str, str | list[dict[str, str]]]) -> None:
     CHATS_DIR.mkdir(exist_ok=True)
-    path = chat_path(chat["id"])
-    path.write_text(json.dumps(chat, indent=2), encoding="utf-8")
+    chat_path(chat["id"]).write_text(json.dumps(chat, indent=2), encoding="utf-8")
 
 
 def load_saved_chats() -> list[dict[str, str | list[dict[str, str]]]]:
@@ -105,7 +65,6 @@ def load_saved_chats() -> list[dict[str, str | list[dict[str, str]]]]:
 
         if not all(key in chat for key in ("id", "title", "timestamp", "messages")):
             continue
-
         if not isinstance(chat["messages"], list):
             continue
 
@@ -125,13 +84,203 @@ def create_chat() -> dict[str, str | list[dict[str, str]]]:
     }
 
 
-def ensure_chat_state() -> None:
-    if "chats" in st.session_state and "active_chat_id" in st.session_state:
-        return
+def load_memory() -> dict:
+    if not MEMORY_PATH.exists():
+        return {}
 
-    chats = load_saved_chats()
-    st.session_state.chats = chats
-    st.session_state.active_chat_id = chats[0]["id"] if chats else None
+    try:
+        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def save_memory(memory: dict) -> None:
+    MEMORY_PATH.write_text(json.dumps(memory, indent=2), encoding="utf-8")
+
+
+def clear_memory() -> None:
+    st.session_state.memory = {}
+    save_memory({})
+
+
+def merge_memory(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing)
+
+    for key, value in incoming.items():
+        if value in (None, "", [], {}):
+            continue
+
+        if isinstance(value, list):
+            current = merged.get(key, [])
+            if not isinstance(current, list):
+                current = [current] if current not in (None, "", {}) else []
+            for item in value:
+                if item not in current:
+                    current.append(item)
+            merged[key] = current
+        elif isinstance(value, dict):
+            current = merged.get(key, {})
+            if isinstance(current, dict):
+                current.update(value)
+                merged[key] = current
+            else:
+                merged[key] = value
+        else:
+            merged[key] = value
+
+    return merged
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def filter_memory_to_message(user_message: str, extracted: dict) -> dict:
+    message_text = normalize_text(user_message)
+    filtered = {}
+
+    for key, value in extracted.items():
+        if isinstance(value, str):
+            if normalize_text(value) in message_text:
+                filtered[key] = value
+        elif isinstance(value, list):
+            kept_items = [
+                item for item in value
+                if isinstance(item, str) and normalize_text(item) in message_text
+            ]
+            if kept_items:
+                filtered[key] = kept_items
+        elif isinstance(value, dict):
+            nested = filter_memory_to_message(user_message, value)
+            if nested:
+                filtered[key] = nested
+
+    return filtered
+
+
+def build_system_prompt(memory: dict) -> str:
+    if not memory:
+        return "You are a helpful, concise assistant."
+
+    memory_blob = json.dumps(memory, ensure_ascii=True)
+    return (
+        "You are a helpful, concise assistant. Use the stored user memory when it is "
+        "relevant to personalize responses, but do not mention the memory store directly. "
+        f"Stored user memory: {memory_blob}"
+    )
+
+
+def build_model_messages(messages: list[dict[str, str]], memory: dict) -> list[dict[str, str]]:
+    return [{"role": "system", "content": build_system_prompt(memory)}, *messages]
+
+
+def parse_json_object(text: str) -> dict:
+    stripped = text.strip()
+
+    if stripped.startswith("```"):
+        fence_parts = stripped.split("```")
+        for part in fence_parts:
+            candidate = part.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate.startswith("{"):
+                stripped = candidate
+                break
+
+    start = stripped.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", stripped, 0)
+
+    depth = 0
+    end = None
+    for index, char in enumerate(stripped[start:], start=start):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+
+    if end is None:
+        raise json.JSONDecodeError("Incomplete JSON object", stripped, start)
+
+    extracted = json.loads(stripped[start:end])
+    return extracted if isinstance(extracted, dict) else {}
+
+
+def stream_model_response(messages: list[dict[str, str]], hf_token: str):
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": 512,
+        "stream": True,
+    }
+
+    with requests.post(
+        API_URL,
+        headers=headers,
+        json=payload,
+        timeout=30,
+        stream=True,
+    ) as response:
+        response.raise_for_status()
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line or not raw_line.startswith("data:"):
+                continue
+
+            data_line = raw_line.removeprefix("data:").strip()
+            if data_line == "[DONE]":
+                break
+
+            chunk = json.loads(data_line)
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                yield content
+                time.sleep(0.02)
+
+
+def extract_memory_from_message(user_message: str, hf_token: str) -> dict:
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    extraction_prompt = (
+        "Given only this user message, extract personal facts or preferences that are explicitly "
+        "stated in the message. Do not infer, guess, generalize, or add unstated traits. "
+        "Use compact JSON with useful keys like name, interests, favorite_topics, "
+        "preferred_language, communication_style, or preferences when directly supported. "
+        "If there are no explicit personal facts, return {}. Return JSON only.\n\n"
+        f"User message: {user_message}"
+    )
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": extraction_prompt}],
+        "max_tokens": 200,
+    }
+
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    content = data["choices"][0]["message"]["content"].strip()
+    extracted = parse_json_object(content)
+    return filter_memory_to_message(user_message, extracted)
+
+
+def ensure_app_state() -> None:
+    if "chats" not in st.session_state or "active_chat_id" not in st.session_state:
+        chats = load_saved_chats()
+        st.session_state.chats = chats
+        st.session_state.active_chat_id = chats[0]["id"] if chats else None
+
+    if "memory" not in st.session_state:
+        st.session_state.memory = load_memory()
 
 
 def get_active_chat() -> dict[str, str | list[dict[str, str]]] | None:
@@ -163,15 +312,13 @@ def delete_chat(chat_id: str) -> None:
 
     if not remaining_chats:
         st.session_state.active_chat_id = None
-        return
-
-    if st.session_state.active_chat_id == chat_id:
+    elif st.session_state.active_chat_id == chat_id:
         st.session_state.active_chat_id = remaining_chats[0]["id"]
 
 
 st.set_page_config(page_title="My AI Chat", layout="wide")
 
-ensure_chat_state()
+ensure_app_state()
 
 st.title("My AI Chat")
 st.write("Chat with the model using the Hugging Face Inference Router.")
@@ -191,7 +338,7 @@ with st.sidebar:
         add_new_chat()
         st.rerun()
 
-    chat_list = st.container(height=500)
+    chat_list = st.container(height=360)
     with chat_list:
         for chat in st.session_state.chats:
             is_active = chat["id"] == st.session_state.active_chat_id
@@ -210,6 +357,16 @@ with st.sidebar:
             if columns[1].button("✕", key=f"delete_{chat['id']}", use_container_width=True):
                 delete_chat(chat["id"])
                 st.rerun()
+
+    with st.expander("User Memory", expanded=True):
+        if st.session_state.memory:
+            st.json(st.session_state.memory)
+        else:
+            st.caption("No saved memory yet.")
+
+        if st.button("Clear Memory", use_container_width=True):
+            clear_memory()
+            st.rerun()
 
 active_chat = get_active_chat()
 
@@ -239,10 +396,12 @@ if prompt:
         with st.chat_message("user"):
             st.write(prompt)
 
+    request_messages = build_model_messages(active_chat["messages"], st.session_state.memory)
+
     with chat_container:
         with st.chat_message("assistant"):
             try:
-                reply = st.write_stream(stream_model_response(active_chat["messages"], hf_token))
+                reply = st.write_stream(stream_model_response(request_messages, hf_token))
                 if not isinstance(reply, str) or not reply.strip():
                     raise ValueError("Empty streamed response")
             except requests.HTTPError as exc:
@@ -264,4 +423,13 @@ if prompt:
     active_chat["messages"].append({"role": "assistant", "content": reply})
     active_chat["timestamp"] = now_iso()
     save_chat(active_chat)
+
+    try:
+        extracted_memory = extract_memory_from_message(prompt, hf_token)
+        if extracted_memory:
+            st.session_state.memory = merge_memory(st.session_state.memory, extracted_memory)
+            save_memory(st.session_state.memory)
+    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
     st.rerun()
